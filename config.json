@@ -1,8 +1,25 @@
 {
   "destination": "EIN",
-  "ryanair_routes": [["VIE", "EIN"], ["BTS", "EIN"]],
-  "google_routes": [["VIE", "EIN"]],
-  "to_airport_cost": {"VIE": 25, "BTS": 35},
+  "ryanair_routes": [
+    [
+      "VIE",
+      "EIN"
+    ],
+    [
+      "BTS",
+      "EIN"
+    ]
+  ],
+  "google_routes": [
+    [
+      "VIE",
+      "EIN"
+    ]
+  ],
+  "to_airport_cost": {
+    "VIE": 25,
+    "BTS": 35
+  },
   "months_ahead": 6,
   "soon_days": 14,
   "budget_eur": 100,
@@ -13,5 +30,8 @@
   "cooldown_hours": 6,
   "quiet_from": 23,
   "quiet_until": 7,
-  "digest_hour": 8
+  "digest_hour": 8,
+  "value_per_day_eur": 8,
+  "recommend_days": 30,
+  "drop_max_vs_budget": 1.5
 }

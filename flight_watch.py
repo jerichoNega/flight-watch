@@ -185,6 +185,7 @@ def db():
     con.execute("CREATE TABLE IF NOT EXISTS opts5 (day TEXT, src TEXT, orig TEXT, dest TEXT, fare REAL, carrier TEXT,"
                 " stops INT, dep TEXT, arr TEXT, link TEXT, seen_at TEXT, PRIMARY KEY(day, src, orig, dest))")
     con.execute("CREATE TABLE IF NOT EXISTS sent (sig TEXT PRIMARY KEY, at TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS hist (day TEXT, orig TEXT, fare REAL, at TEXT)")
     for old in ("opts", "opts4", "prices", "latest", "options"):
         con.execute(f"DROP TABLE IF EXISTS {old}")
     return con
@@ -229,6 +230,83 @@ def picks(after, bud):
         "cheap_soon": min(soon, key=lambda o: (o["fare"], o["day"])) if soon else None,
         "cheapest": min(after.values(), key=lambda o: (o["fare"], o["day"])),
     }
+
+
+def record_history(con, after, stamp):
+    """Store a fare per departure day only when it changed."""
+    for d, o in after.items():
+        last = con.execute("SELECT fare, orig FROM hist WHERE day=? ORDER BY at DESC LIMIT 1", (d,)).fetchone()
+        if not last or abs(last[0] - o["fare"]) >= 0.5 or last[1] != o["orig"]:
+            con.execute("INSERT INTO hist VALUES (?,?,?,?)", (d, o["orig"], o["fare"], stamp))
+    con.execute("DELETE FROM hist WHERE day < ?", (today().isoformat(),))
+
+
+def trend(con, o, hours=24):
+    """Fare change for this day over the last `hours` (None if unknown)."""
+    since = (now() - timedelta(hours=hours)).isoformat()
+    r = con.execute("SELECT fare FROM hist WHERE day=? AND at<=? ORDER BY at DESC LIMIT 1", (o["day"], since)).fetchone()
+    if not r:
+        r = con.execute("SELECT fare FROM hist WHERE day=? ORDER BY at ASC LIMIT 1", (o["day"],)).fetchone()
+    return round(o["fare"] - r[0]) if r else None
+
+
+def recommend(con, after, p, bud):
+    """Pick the flight with the best balance of arriving soon and paying little."""
+    end = (today() + timedelta(days=CFG["recommend_days"])).isoformat()
+    cands = [o for d, o in after.items() if d <= end]
+    if not cands:
+        return None
+    vpd, cost = CFG["value_per_day_eur"], CFG["to_airport_cost"]
+
+    def days_out(o):
+        return (datetime.strptime(o["day"], "%Y-%m-%d").date() - today()).days
+
+    def score(o):
+        return o["fare"] + cost.get(o["orig"], 0) + days_out(o) * vpd
+
+    rec = min(cands, key=lambda o: (score(o), o["day"]))
+    why = []
+    best = p.get("best")
+    if best and best["day"] != rec["day"]:
+        dd = days_out(rec) - days_out(best)
+        saved = best["fare"] - rec["fare"]
+        if dd > 0:
+            why.append(f"{dd} day{'s' if dd > 1 else ''} later than the ⭐ flight but €{saved:.0f} cheaper")
+        else:
+            why.append(f"{-dd} day{'s' if dd < -1 else ''} earlier than the ⭐ flight for €{-saved:.0f} more")
+    elif best:
+        why.append("the soonest flight under budget is also the best value")
+    else:
+        why.append(f"nothing under €{bud:.0f}, this is the best balance of soon and cheap")
+    if rec["fare"] > bud:
+        why.append(f"€{rec['fare'] - bud:.0f} over your €{bud:.0f} budget")
+    if rec["orig"] == "BTS":
+        why.append("from Bratislava (a bit longer trip there)")
+    t = trend(con, rec)
+    if t is not None and t <= -3:
+        why.append(f"just dropped €{-t} in 24h")
+    elif t is not None and t >= 3:
+        why.append(f"went up €{t} in 24h")
+    n = days_out(rec)
+    if n <= 14 or (t is not None and t > 0):
+        advice = "Book now: low-cost fares rarely get cheaper this close to departure."
+    elif rec["fare"] <= 30:
+        advice = "Book now: this is already a rock-bottom fare."
+    else:
+        advice = "No rush yet: I keep watching and tell you if it goes up or something better shows up."
+    return {"o": rec, "why": why, "advice": advice}
+
+
+def day_drops(after, prev_days, bud):
+    """Days in the next soon_days that got cheaper since the last run."""
+    end = (today() + timedelta(days=CFG["soon_days"])).isoformat()
+    out = []
+    for d, o in sorted(after.items()):
+        old = prev_days.get(d)
+        if d <= end and old is not None and o["fare"] <= old - CFG["alert_change_eur"] \
+                and o["fare"] <= bud * CFG["drop_max_vs_budget"]:
+            out.append((o, old))
+    return out
 
 
 # ---------------------------------------------------------------- presentation
@@ -289,8 +367,20 @@ def buttons_for(p):
     return rows
 
 
-def message(p, prev, changed, after, bud, headline, footer=""):
+def message(p, prev, changed, after, bud, headline, footer="", rec=None, drops=()):
     out = [headline, f"<i>{now():%a %d %b, %H:%M}</i>", ""]
+    if drops:
+        out.append("📉 <b>Got cheaper</b>")
+        for o, old in drops:
+            out.append(f"• {e(short_day(o['day']))} · <b>€{o['fare']:.0f}</b> <s>€{old:.0f}</s> · "
+                       f"{e(o['dep'] or '')} {CITY.get(o['orig'], o['orig'])} · <a href=\"{e(o['link'])}\">book</a>")
+        out.append("")
+    if rec:
+        o = rec["o"]
+        out += [f"🧠 <b>My pick: {e(short_day(o['day']))} · €{o['fare']:.0f}</b>",
+                f"✈️ {e(flight_txt(o))}",
+                f"<i>Why: {e('; '.join(rec['why']))}.</i>",
+                f"👉 {e(rec['advice'])}", ""]
     if not p.get("best"):
         out += [f"⭐ <b>No flight under €{bud:.0f}</b> in the next {CFG['months_ahead']} months.", ""]
     shown = []
@@ -316,7 +406,15 @@ def message(p, prev, changed, after, bud, headline, footer=""):
                 f"<i>VIE Vienna · BTS Bratislava · ↪ stop · ✓ under €{bud:.0f}</i>"]
     if footer:
         out += ["", footer]
-    return "\n".join(out), buttons_for(p)
+    buttons = buttons_for(p)
+    if rec and not any(rec["o"]["link"] == b[0]["url"] and short_day(rec["o"]["day"]) in b[0]["text"] for b in buttons):
+        buttons.insert(0, [{"text": f"🧠 My pick: {short_day(rec['o']['day'])} · €{rec['o']['fare']:.0f} →",
+                            "url": rec["o"]["link"]}])
+    elif rec:
+        for b in buttons:
+            if rec["o"]["link"] == b[0]["url"] and short_day(rec["o"]["day"]) in b[0]["text"]:
+                b[0]["text"] = "🧠 " + b[0]["text"]
+    return "\n".join(out), buttons
 
 
 # ---------------------------------------------------------------- telegram
@@ -464,6 +562,17 @@ def run(force_summary=False):
     budget_changed = prev.get("_budget") not in (None, bud)
     keys = alert_keys(p, prev) if prev and not budget_changed else []
 
+    prev_days = json.loads(get_state(con, "days", "{}"))
+    drops = []
+    for o, old in day_drops(after, prev_days, bud) if prev_days else []:
+        s = f"drop|{o['day']}|{o['fare']}"
+        if con.execute("SELECT 1 FROM sent WHERE sig=?", (s,)).fetchone():
+            continue
+        drops.append((o, old))
+        con.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (s, stamp))
+    record_history(con, after, stamp)
+    rec = recommend(con, after, p, bud)
+
     fresh = []  # cooldown: never the exact same alert twice within cooldown_hours
     for k in keys:
         s = f"{k}|{json.dumps(sig(p.get(k)))}"
@@ -475,18 +584,21 @@ def run(force_summary=False):
 
     digest_due = t0.hour >= CFG["digest_hour"] and get_state(con, "digest_day") != day_key
     log(f"{sum(len(r) for _, r in batches)} fares from {[s for s, _ in batches]}, {len(after)} days, "
-        f"alerts={fresh}" + (f", FAILED {failed}" if failed else ""))
+        f"alerts={fresh}, drops={len(drops)}" + (f", FAILED {failed}" if failed else ""))
 
-    if p and (fresh or want_now or digest_due or not prev):
+    if p and (fresh or drops or want_now or digest_due or not prev):
         footer = ""
         if digest_due:
             footer = (f"<i>✅ Running: {get_state(con, 'runs_yesterday', 0)} checks yesterday. "
                       f"/now for a fresh look, /budget 80 to change the limit.</i>")
-        text, buttons = message(p, prev, fresh, after, bud,
-                                headline(fresh, p, prev, bud, digest_due) + " · to Eindhoven", footer)
+        head = headline(fresh, p, prev, bud, digest_due)
+        if drops and not fresh:
+            head = "📉 <b>Prices dropped</b>"
+        text, buttons = message(p, prev, fresh, after, bud, head + " · to Eindhoven", footer, rec, drops)
         send(text, buttons)
         if digest_due:
             set_state(con, "digest_day", day_key)
+    set_state(con, "days", json.dumps({d: o["fare"] for d, o in after.items()}))
     set_state(con, "picks", json.dumps({**{k: sig(o) for k, o in p.items()}, "_budget": bud}))
 
     if failed and get_state(con, "err_day") != day_key:

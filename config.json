@@ -1,0 +1,33 @@
+{
+  "home": "VIE",
+  "destination": "EIN",
+  "ryanair_routes": [
+    [
+      "VIE",
+      "EIN"
+    ],
+    [
+      "BTS",
+      "EIN"
+    ]
+  ],
+  "google_routes": [
+    [
+      "VIE",
+      "EIN"
+    ]
+  ],
+  "to_airport_cost": {
+    "VIE": 25,
+    "BTS": 35
+  },
+  "from_airport_cost": {},
+  "from_airport_note": {},
+  "months_ahead": 6,
+  "soon_days": 14,
+  "google_days": 14,
+  "google_every_min": 15,
+  "min_change_eur": 1,
+  "digest_hour": 8,
+  "budget_eur": 100
+}

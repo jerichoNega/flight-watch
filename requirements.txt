@@ -1,0 +1,5 @@
+faster-flights==3.8.0
+primp==2.0.1
+protobuf==7.36.2
+selectolax==1.0.2
+typing_extensions==4.16.0

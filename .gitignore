@@ -1,0 +1,5 @@
+prices*.db
+telegram.env
+.venv/
+watch.log
+__pycache__/

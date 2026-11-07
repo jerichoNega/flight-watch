@@ -1,44 +1,40 @@
 #!/usr/bin/env python3
-"""Flight watcher Vienna -> Eindhoven: the SOONEST flight that is not expensive (fare <= budget_eur),
-plus the soonest at any price and the cheapest.
+"""Flight watch: the SOONEST flight to Eindhoven that is not expensive.
 
-Sources:
-  - Ryanair fare API for every route in config `ryanair_routes` (Vienna and Bratislava,
-    to Eindhoven and nearby airports). Lowest fare per day, months ahead.
-  - Google Flights (faster-flights) for `google_routes`, next `google_days` days (KLM, Austrian, ...).
-Every option is compared on total door cost: fare + bus to the departure airport + train from
-the arrival airport (estimates in config).
+Every run (GitHub Actions, ~5 min):
+  1. Reads Telegram commands (/now, /budget N, /help).
+  2. Fetches fares: Ryanair fare API for `ryanair_routes` (months ahead) and Google Flights
+     for `google_routes` (next `google_days` days, every `google_every_min` min).
+  3. Drops flights that can no longer be caught (departure < now + min_lead_hours).
+  4. Picks: best = soonest flight with fare <= budget; soonest at any price; cheapest in the
+     next `soon_days` days; cheapest overall. Departure airports are ranked with an estimated
+     cost of getting there (to_airport_cost), only the fare is shown.
+  5. Telegram alert when best changes (earlier date / price move) or a cheaper flight appears.
+     No repeats of the same alert within `cooldown_hours`, silent at night, digest every morning.
 
-Ranking adds an estimated cost of getting to each departure airport (to_airport_cost).
-Telegram message whenever the soonest flight, the cheapest flight in the next 2 weeks or the
-cheapest flight overall changes, plus one morning digest.
-
-  flight_watch.py              normal check
-  flight_watch.py --summary    send the overview now
+Secrets: env TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (or local telegram.env).
 """
 import html
 import json
 import os
-import platform
 import sqlite3
-import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 CFG = json.loads((HERE / "config.json").read_text())
 DB = HERE / "prices.db"
-TZ = ZoneInfo("Europe/Amsterdam")
+TZ = ZoneInfo("Europe/Vienna")  # Vienna and Amsterdam share a time zone
 RYANAIR = ("https://services-api.ryanair.com/farfnd/v4/oneWayFares/{o}/{d}/cheapestPerDay"
            "?outboundMonthOfDate={m}&currency=EUR")
-HOME, DEST = CFG["home"], CFG["destination"]
-CITY = {"VIE": "Vienna", "BTS": "Bratislava", "EIN": "Eindhoven", "AMS": "Amsterdam", "CRL": "Charleroi",
-        "CGN": "Cologne", "DUS": "Düsseldorf", "NRN": "Weeze", "BRU": "Brussels"}
+CITY = {"VIE": "Vienna", "BTS": "Bratislava", "EIN": "Eindhoven"}
+ICON = {"best": "⭐", "soonest": "⏩", "cheap_soon": "💶", "cheapest": "🏆"}
 
 
 def log(msg):
@@ -69,15 +65,19 @@ def secrets():
     return out
 
 
-# ---------------------------------------------------------------- sources
+def now():
+    return datetime.now(TZ)
+
 
 def today():
-    return datetime.now(TZ).date()
+    return now().date()
 
+
+# ---------------------------------------------------------------- sources
+# row = (day, src, orig, dest, fare, carrier, stops, dep "HH:MM", arr "HH:MM", link)
 
 def months_ahead(n):
-    t = today()
-    y, m = t.year, t.month
+    y, m = today().year, today().month
     for _ in range(n):
         yield f"{y}-{m:02d}-01"
         m += 1
@@ -95,9 +95,20 @@ def google_link(orig, dest, day):
     return "https://www.google.com/travel/flights?q=" + urllib.parse.quote(q) + "&curr=EUR"
 
 
+def catchable(day, dep):
+    """False if the flight leaves too soon to still get to the airport."""
+    if day < today().isoformat():
+        return False
+    if not dep:
+        return True
+    try:
+        t = datetime.strptime(f"{day} {dep}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        return True
+    return t >= now() + timedelta(hours=CFG["min_lead_hours"])
+
+
 def fetch_ryanair():
-    """[(day, src, orig, dest, fare, carrier, stops, link)]"""
-    t = today().isoformat()
     rows, errors = [], 0
     for orig, dest in CFG["ryanair_routes"]:
         for m in months_ahead(CFG["months_ahead"]):
@@ -112,13 +123,30 @@ def fetch_ryanair():
                 errors += 1
                 continue
             for f in data.get("outbound", {}).get("fares", []):
-                if f.get("unavailable") or f.get("soldOut") or not f.get("price") or f["day"] < t:
+                if f.get("unavailable") or f.get("soldOut") or not f.get("price"):
                     continue
-                rows.append((f["day"], "ryanair", orig, dest, round(float(f["price"]["value"]), 2),
-                             "Ryanair", 0, ryanair_link(orig, dest, f["day"])))
+                dep, arr = f.get("departureDate") or "", f.get("arrivalDate") or ""
+                rows.append((f["day"], "ryanair", orig, dest, round(float(f["price"]["value"]), 2), "Ryanair", 0,
+                             dep[11:16], arr[11:16], ryanair_link(orig, dest, f["day"])))
     if errors and not rows:
         raise RuntimeError(f"Ryanair: {errors} failed requests, no fares")
     return rows
+
+
+def _hm(t, ref=None):
+    """'HH:MM', plus ' +1' when it lands on a later date than ref."""
+    hm = list(getattr(t, "time", None) or [])
+    if not hm:
+        return ""
+    out = f"{hm[0]:02d}:{(hm[1] if len(hm) > 1 else 0):02d}"
+    d, rd = list(getattr(t, "date", None) or []), list(getattr(ref, "date", None) or [])
+    if ref is not None and d and rd and d > rd:
+        try:
+            from datetime import date as _d
+            out += f" +{(_d(*d) - _d(*rd)).days}"
+        except Exception:
+            out += " +1"
+    return out
 
 
 def fetch_google():
@@ -133,18 +161,19 @@ def fetch_google():
             res = None
             for attempt in range(2):
                 try:
-                    res = [f for f in get_flights(q) if f.price]
+                    res = [f for f in get_flights(q) if f.price and getattr(f, "flights", None)]
                     break
                 except Exception as err:
                     if attempt:
                         log(f"google {orig}-{dest} {day}: {err!r}"[:160])
                     time.sleep(2)
-            if not res:
-                continue
-            best = min(res, key=lambda f: f.price)
-            stops = max(len(best.flights) - 1, 0) if getattr(best, "flights", None) else 0
-            rows.append((day, "google", orig, dest, float(best.price), " / ".join(best.airlines), stops,
-                         google_link(orig, dest, day)))
+            for f in sorted(res or [], key=lambda f: f.price):
+                dep = _hm(f.flights[0].departure)
+                if not catchable(day, dep):
+                    continue  # cheapest one she can still make
+                rows.append((day, "google", orig, dest, float(f.price), " / ".join(f.airlines),
+                             len(f.flights) - 1, dep, _hm(f.flights[-1].arrival, f.flights[0].departure), google_link(orig, dest, day)))
+                break
     return rows
 
 
@@ -152,51 +181,53 @@ def fetch_google():
 
 def db():
     con = sqlite3.connect(DB)
-    con.execute("CREATE TABLE IF NOT EXISTS prices (route TEXT, day TEXT, price REAL, seen_at TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS opts4 (day TEXT, src TEXT, orig TEXT, dest TEXT, fare REAL, carrier TEXT,"
-                " stops INT, link TEXT, seen_at TEXT, PRIMARY KEY(day, src, orig, dest))")
+    con.execute("CREATE TABLE IF NOT EXISTS opts5 (day TEXT, src TEXT, orig TEXT, dest TEXT, fare REAL, carrier TEXT,"
+                " stops INT, dep TEXT, arr TEXT, link TEXT, seen_at TEXT, PRIMARY KEY(day, src, orig, dest))")
+    con.execute("CREATE TABLE IF NOT EXISTS sent (sig TEXT PRIMARY KEY, at TEXT)")
+    for old in ("opts", "opts4", "prices", "latest", "options"):
+        con.execute(f"DROP TABLE IF EXISTS {old}")
     return con
 
 
-def get_state(con, k):
+def get_state(con, k, default=None):
     r = con.execute("SELECT v FROM state WHERE k=?", (k,)).fetchone()
-    return r[0] if r else None
+    return r[0] if r else default
 
 
 def set_state(con, k, v):
     con.execute("INSERT OR REPLACE INTO state VALUES (?,?)", (k, str(v)))
 
 
-def extra_cost(orig, dest):
-    return CFG["to_airport_cost"].get(orig, 0) + CFG["from_airport_cost"].get(dest, 0)
+def budget(con):
+    return float(get_state(con, "budget", CFG["budget_eur"]))
 
 
 def best_per_day(con):
-    """{day: option} cheapest door-to-door option per departure day."""
-    rows = con.execute("SELECT day, orig, dest, fare, carrier, stops, link FROM opts4 WHERE day>=?",
-                       (today().isoformat(),)).fetchall()
+    """{day: option}: per departure day the option with the lowest fare + cost of reaching that airport."""
+    rows = con.execute("SELECT day, orig, dest, fare, carrier, stops, dep, arr, link FROM opts5").fetchall()
+    cost = CFG["to_airport_cost"]
     out = {}
-    for day, orig, dest, fare, carrier, stops, link in sorted(rows, key=lambda r: r[3] + extra_cost(r[1], r[2])):
-        x = extra_cost(orig, dest)
-        out.setdefault(day, {"day": day, "orig": orig, "dest": dest, "fare": fare, "extra": x,
-                             "total": round(fare + x, 2), "carrier": carrier, "stops": stops, "link": link})
+    for day, orig, dest, fare, carrier, stops, dep, arr, link in sorted(rows, key=lambda r: r[3] + cost.get(r[1], 0)):
+        if day in out or not catchable(day, dep):
+            continue
+        out[day] = {"day": day, "orig": orig, "dest": dest, "fare": fare, "carrier": carrier, "stops": stops,
+                    "dep": dep, "arr": arr, "link": link}
     return out
 
 
-def picks(after):
-    """The three things Jericho cares about."""
+def picks(after, bud):
     if not after:
         return {}
     days = sorted(after)
     soon_end = (today() + timedelta(days=CFG["soon_days"])).isoformat()
     soon = [after[d] for d in days if d <= soon_end]
-    ok = [after[d] for d in days if after[d]["fare"] <= CFG["budget_eur"]]
+    ok = [after[d] for d in days if after[d]["fare"] <= bud]
     return {
         "best": ok[0] if ok else None,
         "soonest": after[days[0]],
-        "cheap_soon": min(soon, key=lambda o: (o["total"], o["day"])) if soon else None,
-        "cheapest": min(after.values(), key=lambda o: (o["total"], o["day"])),
+        "cheap_soon": min(soon, key=lambda o: (o["fare"], o["day"])) if soon else None,
+        "cheapest": min(after.values(), key=lambda o: (o["fare"], o["day"])),
     }
 
 
@@ -215,13 +246,10 @@ def short_day(d):
     return datetime.strptime(d, "%Y-%m-%d").strftime("%a %d %b")
 
 
-def route_txt(o):
+def flight_txt(o):
     stops = "direct" if not o["stops"] else f"{o['stops']} stop" + ("s" if o["stops"] > 1 else "")
-    return f"{o['carrier']} · {stops} · {CITY.get(o['orig'], o['orig'])} → {CITY.get(o['dest'], o['dest'])}"
-
-
-def price_txt(o):
-    return f"<b>€{o['fare']:.0f}</b>"
+    times = f"{o['dep']} → {o['arr']} · " if o.get("dep") else ""
+    return f"{times}{o['carrier']} {stops} · {CITY.get(o['orig'], o['orig'])} → {CITY.get(o['dest'], o['dest'])}"
 
 
 def bar(v, lo, hi, width=8):
@@ -231,169 +259,243 @@ def bar(v, lo, hi, width=8):
     return "▰" * n + "▱" * (width - n)
 
 
-def block(icon, title, o, prev=None):
+def titles(bud):
+    return {"best": f"Soonest flight under €{bud:.0f}", "soonest": "Soonest flight (any price)",
+            "cheap_soon": f"Cheapest in the next {CFG['soon_days']} days", "cheapest": "Cheapest overall"}
+
+
+def block(key, title, o, prev=None, mark=""):
     delta = ""
     if prev:
         if prev["day"] != o["day"]:
-            delta = f"  <i>(was {e(short_day(prev['day']))} €{prev.get('fare', prev['total']):.0f})</i>"
-        elif abs(prev.get("fare", prev["total"]) - o["fare"]) >= 1:
-            arrow = "📉" if o["fare"] < prev.get("fare", prev["total"]) else "📈"
-            delta = f"  {arrow} <s>€{prev.get('fare', prev['total']):.0f}</s>"
-    return (f"{icon} <b>{title}</b>\n"
-            f"🗓 {e(short_day(o['day']))} · {e(in_days(o['day']))}\n"
-            f"💶 {price_txt(o)}{delta}\n"
-            f"✈️ {e(route_txt(o))}")
+            delta = f"  <i>(was {e(short_day(prev['day']))}, €{prev['fare']:.0f})</i>"
+        elif abs(prev["fare"] - o["fare"]) >= 1:
+            delta = f"  {'📉' if o['fare'] < prev['fare'] else '📈'} <s>€{prev['fare']:.0f}</s>"
+    return (f"{ICON[key]} <b>{title}</b>{mark}\n"
+            f"🗓 <b>{e(short_day(o['day']))}</b> · {e(in_days(o['day']))}\n"
+            f"💶 <b>€{o['fare']:.0f}</b>{delta}\n"
+            f"✈️ {e(flight_txt(o))}")
 
 
 def buttons_for(p):
+    labels = {"best": "⭐ Book best", "soonest": "⏩ Soonest", "cheap_soon": "💶 Cheapest 2 wks", "cheapest": "🏆 Cheapest"}
     seen, rows = set(), []
-    for icon, key in (("⭐ Best", "best"), ("⏩ Soonest", "soonest"), ("💶 Cheapest 2 wks", "cheap_soon"),
-                      ("🏆 Cheapest", "cheapest")):
+    for key in ("best", "soonest", "cheap_soon", "cheapest"):
         o = p.get(key)
         if not o or (o["day"], o["link"]) in seen:
             continue
         seen.add((o["day"], o["link"]))
-        rows.append([{"text": f"{icon}: {short_day(o['day'])} · €{o['fare']:.0f} →", "url": o["link"]}])
+        rows.append([{"text": f"{labels[key]}: {short_day(o['day'])} · €{o['fare']:.0f} →", "url": o["link"]}])
     return rows
 
 
-def update_message(p, prev, changed, after):
-    head = "🔔 <b>Update</b>" if prev else "✈️ <b>Flight watch</b>"
-    out = [f"{head} · flights to {CITY[DEST]}", f"<i>{datetime.now(TZ):%a %d %b, %H:%M}</i>", ""]
-    titles = {"best": ("⭐", f"Soonest flight under €{CFG['budget_eur']}"),
-              "soonest": ("⏩", "Soonest flight (any price)"),
-              "cheap_soon": ("💶", f"Cheapest in the next {CFG['soon_days']} days"),
-              "cheapest": ("🏆", "Cheapest overall")}
+def message(p, prev, changed, after, bud, headline, footer=""):
+    out = [headline, f"<i>{now():%a %d %b, %H:%M}</i>", ""]
+    if not p.get("best"):
+        out += [f"⭐ <b>No flight under €{bud:.0f}</b> in the next {CFG['months_ahead']} months.", ""]
     shown = []
     for key in ("best", "soonest", "cheap_soon", "cheapest"):
         o = p.get(key)
         if not o:
             continue
+        t = titles(bud)[key]
         dup = next((k for k in shown if p[k]["day"] == o["day"] and p[k]["link"] == o["link"]), None)
-        icon, title = titles[key]
-        mark = " 🆕" if key in changed else ""
         if dup:
-            out.append(f"{icon} <b>{title}</b>{mark}: same as above\n")
+            out.append(f"{ICON[key]} <b>{t}</b>: same as {ICON[dup]}\n")
         else:
-            out.append(block(icon, title + mark, o, (prev or {}).get(key) if key in changed else None) + "\n")
+            out.append(block(key, t, o, (prev or {}).get(key) if key in changed else None,
+                             " 🆕" if key in changed else "") + "\n")
         shown.append(key)
-    # 14-day chart
     soon_end = (today() + timedelta(days=CFG["soon_days"])).isoformat()
     soon = [o for d, o in sorted(after.items()) if d <= soon_end]
     if soon:
         lo, hi = min(o["fare"] for o in soon), max(o["fare"] for o in soon)
-        rows = []
-        for o in soon:
-            rows.append(f"{short_day(o['day'])[:6]} {bar(o['fare'], lo, hi)} €{o['fare']:>4.0f} {o['orig']}{' ↪' if o['stops'] else ''}")
-        out.append(f"📅 <b>Next {CFG['soon_days']} days</b>")
-        out.append("<pre>" + e("\n".join(rows)) + "</pre>")
-        out.append("<i>VIE = from Vienna · BTS = from Bratislava · ↪ with a stop</i>")
+        rows = [f"{short_day(o['day'])[:6]} {bar(o['fare'], lo, hi)} €{o['fare']:>4.0f} {o['orig']}"
+                f"{' ↪' if o['stops'] else ''}{' ✓' if o['fare'] <= bud else ''}" for o in soon]
+        out += [f"📅 <b>Next {CFG['soon_days']} days</b>", "<pre>" + e("\n".join(rows)) + "</pre>",
+                f"<i>VIE Vienna · BTS Bratislava · ↪ stop · ✓ under €{bud:.0f}</i>"]
+    if footer:
+        out += ["", footer]
     return "\n".join(out), buttons_for(p)
 
 
-# ---------------------------------------------------------------- notify
+# ---------------------------------------------------------------- telegram
 
-def send_telegram(text, buttons=None):
-    s = secrets()
-    tok, chat = s.get("TELEGRAM_BOT_TOKEN"), s.get("TELEGRAM_CHAT_ID")
-    if not (tok and chat):
+def tg(method, body):
+    tok = secrets().get("TELEGRAM_BOT_TOKEN")
+    if not tok:
+        raise RuntimeError("telegram not configured")
+    return http_json(f"https://api.telegram.org/bot{tok}/{method}", body, timeout=40)
+
+
+def send(text, buttons=None):
+    chat = secrets().get("TELEGRAM_CHAT_ID")
+    if not chat:
         log("telegram not configured")
-        return False
-    body = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        return
+    h = now().hour
+    body = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True,
+            "disable_notification": h >= CFG["quiet_from"] or h < CFG["quiet_until"]}
     if buttons:
         body["reply_markup"] = {"inline_keyboard": buttons}
-    http_json(f"https://api.telegram.org/bot{tok}/sendMessage", body)
-    return True
-
-
-def notify(text, buttons=None, plain=None):
     try:
-        send_telegram(text, buttons)
+        tg("sendMessage", body)
     except urllib.error.HTTPError as err:
-        log(f"telegram failed: {err} {err.read()[:300]!r}")
+        log(f"telegram failed: {err} {err.read()[:200]!r}")
     except Exception as err:
         log(f"telegram failed: {err!r}")
-    if platform.system() == "Darwin" and plain:
-        plain = plain.replace('"', "'")
-        subprocess.run(["osascript", "-e", f'display notification "{plain}" with title "Flight watch"'], check=False)
+
+
+def read_commands(con):
+    """Handle /now, /budget N, /help from the configured chat. Returns True if an overview was asked."""
+    chat = str(secrets().get("TELEGRAM_CHAT_ID", ""))
+    try:
+        upd = tg("getUpdates", {"offset": int(get_state(con, "tg_offset", 0)), "timeout": 0}).get("result", [])
+    except Exception as err:
+        log(f"telegram getUpdates failed: {err!r}")
+        return False
+    want_now = False
+    for u in upd:
+        set_state(con, "tg_offset", u["update_id"] + 1)
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) != chat:
+            continue
+        txt = (m.get("text") or "").strip().lower()
+        if txt.startswith("/budget"):
+            arg = txt.split()[1].replace("€", "") if len(txt.split()) > 1 else ""
+            if arg.isdigit() and 10 <= int(arg) <= 2000:
+                set_state(con, "budget", int(arg))
+                send(f"✅ Budget set to <b>€{int(arg)}</b>. Overview follows.")
+                want_now = True
+            else:
+                send(f"Current budget: <b>€{budget(con):.0f}</b>. Change it with <code>/budget 80</code>.")
+        elif txt.startswith("/now") or txt in ("now", "?", "status"):
+            want_now = True
+        elif txt.startswith("/help") or txt.startswith("/start"):
+            send("✈️ <b>Flight watch</b> checks flights to Eindhoven every ~5 min.\n\n"
+                 "/now  current soonest and cheapest flights\n"
+                 "/budget 80  what counts as \"not expensive\"\n\n"
+                 "Alerts come by themselves when the best flight changes. "
+                 "Replies can take up to ~10 min (that is how often it wakes up).")
+    return want_now
 
 
 # ---------------------------------------------------------------- main
 
 def sig(o):
-    return {"day": o["day"], "total": o["total"], "fare": o["fare"], "link": o["link"]} if o else None
+    return {"day": o["day"], "fare": o["fare"], "link": o["link"]} if o else None
 
 
-def changed_keys(p, prev):
+def alert_keys(p, prev):
     out = []
-    for k, o in p.items():
-        old = prev.get(k)
-        if o is None:
-            continue
-        if old is None or old["day"] != o["day"] or abs(old["total"] - o["total"]) >= CFG["min_change_eur"]:
+    b, pb = p.get("best"), prev.get("best")
+    step = CFG["alert_change_eur"]
+    if b and (not pb or pb["day"] != b["day"] or abs(pb["fare"] - b["fare"]) >= step):
+        out.append("best")
+    elif not b and pb:
+        out.append("best")  # the affordable flight disappeared
+    for k in ("cheap_soon", "cheapest"):
+        o, po = p.get(k), prev.get(k)
+        if o and po and o["fare"] <= po["fare"] - step:
             out.append(k)
     return out
 
 
-def run(summary=False):
-    con = db()
-    now = datetime.now(TZ)
-    failed = []
+def headline(fresh, p, prev, bud, digest_due):
+    b, pb = p.get("best"), prev.get("best")
+    if "best" in fresh:
+        if not b:
+            return f"⚠️ <b>No flight under €{bud:.0f} anymore</b>"
+        if pb and b["day"] < pb["day"]:
+            return "🎯 <b>Earlier affordable flight!</b>"
+        if pb and b["day"] > pb["day"]:
+            return "⚠️ <b>The best flight is gone or got pricier</b>"
+        if pb and b["fare"] > pb["fare"]:
+            return "📈 <b>Best flight got more expensive, book soon</b>"
+        return "🔔 <b>Best flight got cheaper</b>"
+    if fresh:
+        return "🔔 <b>Price drop</b>"
+    return "☀️ <b>Morning update</b>" if digest_due else "✈️ <b>Flight watch</b>"
 
-    batches = []
+
+def run(force_summary=False):
+    con = db()
+    t0 = now()
+    want_now = read_commands(con) or force_summary
+    failed, batches = [], []
+
     try:
         batches.append(("ryanair", fetch_ryanair()))
     except Exception as err:
         failed.append(repr(err))
     last_g = get_state(con, "google_at")
-    if summary or not last_g or now - datetime.fromisoformat(last_g) >= timedelta(minutes=CFG["google_every_min"]):
+    if want_now or not last_g or t0 - datetime.fromisoformat(last_g) >= timedelta(minutes=CFG["google_every_min"]):
         g = fetch_google()
         if g:
             batches.append(("google", g))
-            set_state(con, "google_at", now.isoformat(timespec="seconds"))
+            set_state(con, "google_at", t0.isoformat(timespec="seconds"))
         else:
             failed.append("Google Flights returned nothing")
 
-    stamp = now.isoformat(timespec="seconds")
-    for src, rows in batches:
-        con.execute("DELETE FROM opts4 WHERE src=?", (src,))  # full refresh per source
-        for row in rows:
-            con.execute("INSERT OR REPLACE INTO opts4 VALUES (?,?,?,?,?,?,?,?,?)", (*row, stamp))
-            con.execute("INSERT INTO prices VALUES (?,?,?,?)", (f"{row[1]}:{row[2]}-{row[3]}", row[0], row[4], stamp))
-    con.execute("DELETE FROM prices WHERE seen_at < ?", ((now - timedelta(days=3)).isoformat(),))
-    con.execute("DELETE FROM opts4 WHERE day < ?", (today().isoformat(),))
+    stamp = t0.isoformat(timespec="seconds")
     routes = {tuple(r) for r in CFG["ryanair_routes"] + CFG["google_routes"]}
-    for orig, dest in con.execute("SELECT DISTINCT orig, dest FROM opts4").fetchall():
+    for src, rows in batches:
+        con.execute("DELETE FROM opts5 WHERE src=?", (src,))
+        for row in rows:
+            con.execute("INSERT OR REPLACE INTO opts5 VALUES (?,?,?,?,?,?,?,?,?,?,?)", (*row, stamp))
+    for orig, dest in con.execute("SELECT DISTINCT orig, dest FROM opts5").fetchall():
         if (orig, dest) not in routes:
-            con.execute("DELETE FROM opts4 WHERE orig=? AND dest=?", (orig, dest))
+            con.execute("DELETE FROM opts5 WHERE orig=? AND dest=?", (orig, dest))
+    con.execute("DELETE FROM opts5 WHERE day < ?", (today().isoformat(),))
+    con.execute("DELETE FROM sent WHERE at < ?", ((t0 - timedelta(days=2)).isoformat(),))
+
+    day_key = today().isoformat()
+    if get_state(con, "runs_day") != day_key:
+        set_state(con, "runs_yesterday", get_state(con, "runs_today", 0))
+        set_state(con, "runs_day", day_key)
+        set_state(con, "runs_today", 0)
+    set_state(con, "runs_today", int(get_state(con, "runs_today", 0)) + 1)
     con.commit()
 
+    bud = budget(con)
     after = best_per_day(con)
-    p = picks(after)
-    prev = json.loads(get_state(con, "picks") or "{}")
-    changed = changed_keys(p, prev) if prev else list(p)
+    p = picks(after, bud)
+    prev = json.loads(get_state(con, "picks", "{}"))
+    budget_changed = prev.get("_budget") not in (None, bud)
+    keys = alert_keys(p, prev) if prev and not budget_changed else []
 
-    # morning digest so there is news every day even without changes
-    digest_due = False
-    slot = f"{now.date()}"
-    if now.hour >= CFG["digest_hour"] and get_state(con, "digest_day") != slot:
-        digest_due = True
+    fresh = []  # cooldown: never the exact same alert twice within cooldown_hours
+    for k in keys:
+        s = f"{k}|{json.dumps(sig(p.get(k)))}"
+        r = con.execute("SELECT at FROM sent WHERE sig=?", (s,)).fetchone()
+        if r and t0 - datetime.fromisoformat(r[0]) < timedelta(hours=CFG["cooldown_hours"]):
+            continue
+        fresh.append(k)
+        con.execute("INSERT OR REPLACE INTO sent VALUES (?,?)", (s, stamp))
 
+    digest_due = t0.hour >= CFG["digest_hour"] and get_state(con, "digest_day") != day_key
     log(f"{sum(len(r) for _, r in batches)} fares from {[s for s, _ in batches]}, {len(after)} days, "
-        f"changed={changed}" + (f", FAILED {failed}" if failed else ""))
+        f"alerts={fresh}" + (f", FAILED {failed}" if failed else ""))
 
-    if p and (changed or summary or digest_due):
-        text, buttons = update_message(p, prev, changed if prev else [], after)
-        notify(text, buttons, plain=" · ".join(f"{k} {short_day(p[k]['day'])} €{p[k]['fare']:.0f}" for k in changed))
-        set_state(con, "digest_day", slot)
-    set_state(con, "picks", json.dumps({k: sig(o) for k, o in p.items()}))
+    if p and (fresh or want_now or digest_due or not prev):
+        footer = ""
+        if digest_due:
+            footer = (f"<i>✅ Running: {get_state(con, 'runs_yesterday', 0)} checks yesterday. "
+                      f"/now for a fresh look, /budget 80 to change the limit.</i>")
+        text, buttons = message(p, prev, fresh, after, bud,
+                                headline(fresh, p, prev, bud, digest_due) + " · to Eindhoven", footer)
+        send(text, buttons)
+        if digest_due:
+            set_state(con, "digest_day", day_key)
+    set_state(con, "picks", json.dumps({**{k: sig(o) for k, o in p.items()}, "_budget": bud}))
 
-    if failed and get_state(con, "err_day") != slot:
-        notify("⚠️ <b>Flight watch</b>: a price source failed\n<code>" + e("; ".join(failed)[:300]) + "</code>")
-        set_state(con, "err_day", slot)
+    if failed and get_state(con, "err_day") != day_key:
+        send("⚠️ <b>Flight watch</b>: a price source failed, still using the other one\n<code>"
+             + e("; ".join(failed)[:300]) + "</code>")
+        set_state(con, "err_day", day_key)
     con.commit()
     con.close()
 
 
 if __name__ == "__main__":
-    run(summary="--summary" in sys.argv)
+    run(force_summary="--summary" in sys.argv)

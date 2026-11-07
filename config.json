@@ -1,33 +1,17 @@
 {
-  "home": "VIE",
   "destination": "EIN",
-  "ryanair_routes": [
-    [
-      "VIE",
-      "EIN"
-    ],
-    [
-      "BTS",
-      "EIN"
-    ]
-  ],
-  "google_routes": [
-    [
-      "VIE",
-      "EIN"
-    ]
-  ],
-  "to_airport_cost": {
-    "VIE": 25,
-    "BTS": 35
-  },
-  "from_airport_cost": {},
-  "from_airport_note": {},
+  "ryanair_routes": [["VIE", "EIN"], ["BTS", "EIN"]],
+  "google_routes": [["VIE", "EIN"]],
+  "to_airport_cost": {"VIE": 25, "BTS": 35},
   "months_ahead": 6,
   "soon_days": 14,
+  "budget_eur": 100,
+  "min_lead_hours": 4,
   "google_days": 14,
   "google_every_min": 15,
-  "min_change_eur": 1,
-  "digest_hour": 8,
-  "budget_eur": 100
+  "alert_change_eur": 3,
+  "cooldown_hours": 6,
+  "quiet_from": 23,
+  "quiet_until": 7,
+  "digest_hour": 8
 }

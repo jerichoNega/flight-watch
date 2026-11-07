@@ -1,23 +1,32 @@
 name: flight-watch
 
+# One run checks every 5 minutes for ~5h40, then starts its own successor.
+# The schedule is only a backup restarter in case the chain ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 min (GitHub may start runs late)
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       summary:
-        description: "Send the overview message"
+        description: "Send the overview message on the first check"
         type: boolean
         default: false
+      minutes:
+        description: "How long this run keeps watching"
+        default: "340"
+
+permissions:
+  actions: write
+  contents: read
 
 concurrency:
   group: flight-watch
   cancel-in-progress: false
 
 jobs:
-  check:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,15 +40,33 @@ jobs:
           path: prices.db
           key: prices-${{ github.run_id }}
           restore-keys: prices-
-      - name: Check fares
+      - name: Watch (check every 5 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TZ: Europe/Amsterdam
-        run: python flight_watch.py ${{ inputs.summary && '--summary' || '' }}
+          SUMMARY: ${{ inputs.summary }}
+          MINUTES: ${{ inputs.minutes || '340' }}
+        run: |
+          case "$MINUTES" in ""|*[!0-9]*) MINUTES=340;; esac
+          end=$((SECONDS + MINUTES * 60))
+          first=1
+          while [ $SECONDS -lt $end ]; do
+            start=$SECONDS
+            arg=""
+            if [ "$first" = 1 ] && [ "$SUMMARY" = "true" ]; then arg="--summary"; fi
+            timeout 240 python flight_watch.py $arg || echo "check failed, continuing"
+            first=0
+            wait=$((300 - (SECONDS - start)))
+            if [ $wait -gt 0 ] && [ $((SECONDS + wait)) -lt $end ]; then sleep $wait; else break; fi
+          done
       - name: Save price state
         if: always()
         uses: actions/cache/save@v4
         with:
           path: prices.db
           key: prices-${{ github.run_id }}
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch.yml --repo ${{ github.repository }} --ref main

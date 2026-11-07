@@ -2,7 +2,7 @@ name: flight-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub may start runs a few minutes late
+    - cron: "*/5 * * * *"   # every 5 min (GitHub may start runs late)
   workflow_dispatch:
     inputs:
       summary:
